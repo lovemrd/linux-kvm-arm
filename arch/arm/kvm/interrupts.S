@@ -48,6 +48,12 @@ __kvm_hyp_code_start:
  * hardware assisted version.
  */
 ENTRY(__kvm_tlb_flush_vmid)
+ THUMB(	.thumb			)
+ THUMB(	.align			)
+ THUMB(	bx	pc		)
+ THUMB(	nop			)
+	.arm
+ THUMB(	orr	lr, lr, #1	)
 	hvc	#0			@ Switch to Hyp mode
 	push	{r2, r3}
 
@@ -65,7 +71,7 @@ ENTRY(__kvm_tlb_flush_vmid)
 
 	pop	{r2, r3}
 	hvc	#0			@ Back to SVC
-	mov	pc, lr
+	bx	lr
 ENDPROC(__kvm_tlb_flush_vmid)
 
 @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
@@ -76,8 +82,13 @@ ENDPROC(__kvm_tlb_flush_vmid)
  * void __kvm_flush_vm_context(void);
  */
 ENTRY(__kvm_flush_vm_context)
+ THUMB(	.thumb			)
+ THUMB(	.align			)
+ THUMB(	bx	pc		)
+ THUMB(	nop			)
+	.arm
+ THUMB(	orr	lr, lr, #1	)
 	hvc	#0			@ switch to hyp-mode
-
 	mov	r0, #0			@ rn parameter for c15 flushes is SBZ
 	mcr     p15, 4, r0, c8, c7, 4   @ Invalidate Non-secure Non-Hyp TLB
 	mcr     p15, 0, r0, c7, c5, 0   @ Invalidate instruction caches
@@ -85,7 +96,7 @@ ENTRY(__kvm_flush_vm_context)
 	isb
 
 	hvc	#0			@ switch back to svc-mode, see hyp_svc
-	bx lr
+	bx	lr
 ENDPROC(__kvm_flush_vm_context)
 
 @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
@@ -268,6 +279,11 @@ ENDPROC(__kvm_flush_vm_context)
 @ Arguments:
 @  r0: pointer to vcpu struct
 ENTRY(__kvm_vcpu_run)
+ THUMB(	.thumb			)
+ THUMB(	.align			)
+ THUMB(	bx	pc		)
+ THUMB(	nop			)
+	.arm
 	hvc	#0			@ switch to hyp-mode
 
 	@ Now we're in Hyp-mode and lr_usr, spsr_hyp are on the stack
@@ -406,7 +422,7 @@ irq_kernel_resume:
 	add	sp, sp, #8
 
 return_to_ioctl:
-THUMB(	orr	lr, lr, #1)
+ THUMB( orr	lr, lr, #1)
 	mov	pc, lr
 
 
