@@ -81,6 +81,7 @@ static void __cpuinit exynos_secondary_init(unsigned int cpu)
 	spin_unlock(&boot_lock);
 }
 
+asm(".arch_extension sec");
 static int __cpuinit exynos_boot_secondary(unsigned int cpu, struct task_struct *idle)
 {
 	unsigned long timeout;
@@ -181,6 +182,7 @@ static void __init exynos_smp_init_cpus(void)
 
 static void __init exynos_smp_prepare_cpus(unsigned int max_cpus)
 {
+	unsigned long addr;
 	if (!soc_is_exynos5250())
 		scu_enable(scu_base_addr());
 
@@ -190,8 +192,14 @@ static void __init exynos_smp_prepare_cpus(unsigned int max_cpus)
 	 * until it receives a soft interrupt, and then the
 	 * secondary CPU branches to this address.
 	 */
+	addr = virt_to_phys(exynos4_secondary_startup);
+	asm volatile("mov	r0, %[addr]\n\t"
+		     "mov	r7, #0\n\t"
+		     "smc	#0": : [addr] "r" (addr));
+#if 0
 	__raw_writel(virt_to_phys(exynos4_secondary_startup),
 			CPU1_BOOT_REG);
+#endif
 }
 
 struct smp_operations exynos_smp_ops __initdata = {
