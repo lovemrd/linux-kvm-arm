@@ -158,7 +158,9 @@ struct kvm_stats_debugfs_item debugfs_entries[] = {
 
 u64 __read_mostly host_xcr0;
 
-int emulator_fix_hypercall(struct x86_emulate_ctxt *ctxt);
+static int emulator_fix_hypercall(struct x86_emulate_ctxt *ctxt);
+
+static int kvm_vcpu_reset(struct kvm_vcpu *vcpu);
 
 static inline void kvm_async_pf_hash_reset(struct kvm_vcpu *vcpu)
 {
@@ -633,7 +635,7 @@ int kvm_set_cr3(struct kvm_vcpu *vcpu, unsigned long cr3)
 	}
 
 	if (is_long_mode(vcpu)) {
-		if (kvm_read_cr4(vcpu) & X86_CR4_PCIDE) {
+		if (kvm_read_cr4_bits(vcpu, X86_CR4_PCIDE)) {
 			if (cr3 & CR3_PCID_ENABLED_RESERVED_BITS)
 				return 1;
 		} else
@@ -3779,7 +3781,7 @@ static int write_exit_mmio(struct kvm_vcpu *vcpu, gpa_t gpa,
 {
 	struct kvm_mmio_fragment *frag = &vcpu->mmio_fragments[0];
 
-	memcpy(vcpu->run->mmio.data, frag->data, frag->len);
+	memcpy(vcpu->run->mmio.data, frag->data, min(8u, frag->len));
 	return X86EMUL_CONTINUE;
 }
 
@@ -3832,18 +3834,11 @@ mmio:
 	bytes -= handled;
 	val += handled;
 
-	while (bytes) {
-		unsigned now = min(bytes, 8U);
-
-		frag = &vcpu->mmio_fragments[vcpu->mmio_nr_fragments++];
-		frag->gpa = gpa;
-		frag->data = val;
-		frag->len = now;
-
-		gpa += now;
-		val += now;
-		bytes -= now;
-	}
+	WARN_ON(vcpu->mmio_nr_fragments >= KVM_MAX_MMIO_FRAGMENTS);
+	frag = &vcpu->mmio_fragments[vcpu->mmio_nr_fragments++];
+	frag->gpa = gpa;
+	frag->data = val;
+	frag->len = bytes;
 	return X86EMUL_CONTINUE;
 }
 
@@ -3890,7 +3885,7 @@ int emulator_read_write(struct x86_emulate_ctxt *ctxt, unsigned long addr,
 	vcpu->mmio_needed = 1;
 	vcpu->mmio_cur_fragment = 0;
 
-	vcpu->run->mmio.len = vcpu->mmio_fragments[0].len;
+	vcpu->run->mmio.len = min(8u, vcpu->mmio_fragments[0].len);
 	vcpu->run->mmio.is_write = vcpu->mmio_is_write = ops->write;
 	vcpu->run->exit_reason = KVM_EXIT_MMIO;
 	vcpu->run->mmio.phys_addr = gpa;
@@ -4502,7 +4497,7 @@ static bool reexecute_instruction(struct kvm_vcpu *vcpu, gva_t gva)
 	 * instruction -> ...
 	 */
 	pfn = gfn_to_pfn(vcpu->kvm, gpa_to_gfn(gpa));
-	if (!is_error_pfn(pfn)) {
+	if (!is_error_noslot_pfn(pfn)) {
 		kvm_release_pfn_clean(pfn);
 		return true;
 	}
@@ -5066,7 +5061,7 @@ out:
 }
 EXPORT_SYMBOL_GPL(kvm_emulate_hypercall);
 
-int emulator_fix_hypercall(struct x86_emulate_ctxt *ctxt)
+static int emulator_fix_hypercall(struct x86_emulate_ctxt *ctxt)
 {
 	struct kvm_vcpu *vcpu = emul_to_vcpu(ctxt);
 	char instruction[3];
@@ -5426,7 +5421,7 @@ static int __vcpu_run(struct kvm_vcpu *vcpu)
 		pr_debug("vcpu %d received sipi with vector # %x\n",
 			 vcpu->vcpu_id, vcpu->arch.sipi_vector);
 		kvm_lapic_reset(vcpu);
-		r = kvm_arch_vcpu_reset(vcpu);
+		r = kvm_vcpu_reset(vcpu);
 		if (r)
 			return r;
 		vcpu->arch.mp_state = KVM_MP_STATE_RUNNABLE;
@@ -5522,28 +5517,44 @@ static int complete_emulated_pio(struct kvm_vcpu *vcpu)
  *
  * read:
  *   for each fragment
- *     write gpa, len
- *     exit
- *     copy data
+ *     for each mmio piece in the fragment
+ *       write gpa, len
+ *       exit
+ *       copy data
  *   execute insn
  *
  * write:
  *   for each fragment
- *      write gpa, len
- *      copy data
- *      exit
+ *     for each mmio piece in the fragment
+ *       write gpa, len
+ *       copy data
+ *       exit
  */
 static int complete_emulated_mmio(struct kvm_vcpu *vcpu)
 {
 	struct kvm_run *run = vcpu->run;
 	struct kvm_mmio_fragment *frag;
+	unsigned len;
 
 	BUG_ON(!vcpu->mmio_needed);
 
 	/* Complete previous fragment */
-	frag = &vcpu->mmio_fragments[vcpu->mmio_cur_fragment++];
+	frag = &vcpu->mmio_fragments[vcpu->mmio_cur_fragment];
+	len = min(8u, frag->len);
 	if (!vcpu->mmio_is_write)
-		memcpy(frag->data, run->mmio.data, frag->len);
+		memcpy(frag->data, run->mmio.data, len);
+
+	if (frag->len <= 8) {
+		/* Switch to the next fragment. */
+		frag++;
+		vcpu->mmio_cur_fragment++;
+	} else {
+		/* Go forward to the next mmio piece. */
+		frag->data += len;
+		frag->gpa += len;
+		frag->len -= len;
+	}
+
 	if (vcpu->mmio_cur_fragment == vcpu->mmio_nr_fragments) {
 		vcpu->mmio_needed = 0;
 		if (vcpu->mmio_is_write)
@@ -5551,13 +5562,12 @@ static int complete_emulated_mmio(struct kvm_vcpu *vcpu)
 		vcpu->mmio_read_completed = 1;
 		return complete_emulated_io(vcpu);
 	}
-	/* Initiate next fragment */
-	++frag;
+
 	run->exit_reason = KVM_EXIT_MMIO;
 	run->mmio.phys_addr = frag->gpa;
 	if (vcpu->mmio_is_write)
-		memcpy(run->mmio.data, frag->data, frag->len);
-	run->mmio.len = frag->len;
+		memcpy(run->mmio.data, frag->data, min(8u, frag->len));
+	run->mmio.len = min(8u, frag->len);
 	run->mmio.is_write = vcpu->mmio_is_write;
 	vcpu->arch.complete_userspace_io = complete_emulated_mmio;
 	return 0;
@@ -6036,7 +6046,7 @@ int kvm_arch_vcpu_setup(struct kvm_vcpu *vcpu)
 	r = vcpu_load(vcpu);
 	if (r)
 		return r;
-	r = kvm_arch_vcpu_reset(vcpu);
+	r = kvm_vcpu_reset(vcpu);
 	if (r == 0)
 		r = kvm_mmu_setup(vcpu);
 	vcpu_put(vcpu);
@@ -6058,7 +6068,7 @@ void kvm_arch_vcpu_destroy(struct kvm_vcpu *vcpu)
 	kvm_x86_ops->vcpu_free(vcpu);
 }
 
-int kvm_arch_vcpu_reset(struct kvm_vcpu *vcpu)
+static int kvm_vcpu_reset(struct kvm_vcpu *vcpu)
 {
 	atomic_set(&vcpu->arch.nmi_queued, 0);
 	vcpu->arch.nmi_pending = 0;

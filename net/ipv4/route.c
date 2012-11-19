@@ -1163,8 +1163,12 @@ static bool rt_bind_exception(struct rtable *rt, struct fib_nh_exception *fnhe,
 	spin_lock_bh(&fnhe_lock);
 
 	if (daddr == fnhe->fnhe_daddr) {
-		struct rtable *orig;
-
+		struct rtable *orig = rcu_dereference(fnhe->fnhe_rth);
+		if (orig && rt_is_expired(orig)) {
+			fnhe->fnhe_gw = 0;
+			fnhe->fnhe_pmtu = 0;
+			fnhe->fnhe_expires = 0;
+		}
 		if (fnhe->fnhe_pmtu) {
 			unsigned long expires = fnhe->fnhe_expires;
 			unsigned long diff = expires - jiffies;
@@ -1181,7 +1185,6 @@ static bool rt_bind_exception(struct rtable *rt, struct fib_nh_exception *fnhe,
 		} else if (!rt->rt_gateway)
 			rt->rt_gateway = daddr;
 
-		orig = rcu_dereference(fnhe->fnhe_rth);
 		rcu_assign_pointer(fnhe->fnhe_rth, rt);
 		if (orig)
 			rt_free(orig);
@@ -2220,7 +2223,7 @@ static int rt_fill_info(struct net *net,  __be32 dst, __be32 src,
 		goto nla_put_failure;
 
 	if (fl4->flowi4_mark &&
-	    nla_put_be32(skb, RTA_MARK, fl4->flowi4_mark))
+	    nla_put_u32(skb, RTA_MARK, fl4->flowi4_mark))
 		goto nla_put_failure;
 
 	error = rt->dst.error;

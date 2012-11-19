@@ -299,12 +299,20 @@ ENTRY(ret_from_fork)
 	CFI_ENDPROC
 END(ret_from_fork)
 
-ENTRY(ret_from_kernel_execve)
-	movl %eax, %esp
-	movl $0,PT_EAX(%esp)
+ENTRY(ret_from_kernel_thread)
+	CFI_STARTPROC
+	pushl_cfi %eax
+	call schedule_tail
 	GET_THREAD_INFO(%ebp)
+	popl_cfi %eax
+	pushl_cfi $0x0202		# Reset kernel eflags
+	popfl_cfi
+	movl PT_EBP(%esp),%eax
+	call *PT_EBX(%esp)
+	movl $0,PT_EAX(%esp)
 	jmp syscall_exit
-END(ret_from_kernel_execve)
+	CFI_ENDPROC
+ENDPROC(ret_from_kernel_thread)
 
 /*
  * Interrupt exit functions should be protected against kprobes
@@ -1015,21 +1023,6 @@ END(spurious_interrupt_bug)
  */
 	.popsection
 
-ENTRY(ret_from_kernel_thread)
-	CFI_STARTPROC
-	pushl_cfi %eax
-	call schedule_tail
-	GET_THREAD_INFO(%ebp)
-	popl_cfi %eax
-	pushl_cfi $0x0202		# Reset kernel eflags
-	popfl_cfi
-	movl PT_EBP(%esp),%eax
-	call *PT_EBX(%esp)
-	call do_exit
-	ud2			# padding for call trace
-	CFI_ENDPROC
-ENDPROC(ret_from_kernel_thread)
-
 #ifdef CONFIG_XEN
 /* Xen doesn't set %esp to be precisely what the normal sysenter
    entrypoint expects, so fix it up before using the normal path. */
@@ -1042,7 +1035,7 @@ ENTRY(xen_sysenter_target)
 
 ENTRY(xen_hypervisor_callback)
 	CFI_STARTPROC
-	pushl_cfi $0
+	pushl_cfi $-1 /* orig_ax = -1 => not a system call */
 	SAVE_ALL
 	TRACE_IRQS_OFF
 
@@ -1084,14 +1077,16 @@ ENTRY(xen_failsafe_callback)
 2:	mov 8(%esp),%es
 3:	mov 12(%esp),%fs
 4:	mov 16(%esp),%gs
+	/* EAX == 0 => Category 1 (Bad segment)
+	   EAX != 0 => Category 2 (Bad IRET) */
 	testl %eax,%eax
 	popl_cfi %eax
 	lea 16(%esp),%esp
 	CFI_ADJUST_CFA_OFFSET -16
 	jz 5f
 	addl $16,%esp
-	jmp iret_exc		# EAX != 0 => Category 2 (Bad IRET)
-5:	pushl_cfi $0		# EAX == 0 => Category 1 (Bad segment)
+	jmp iret_exc
+5:	pushl_cfi $-1 /* orig_ax = -1 => not a system call */
 	SAVE_ALL
 	jmp ret_from_exception
 	CFI_ENDPROC
