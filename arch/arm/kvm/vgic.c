@@ -97,6 +97,22 @@ static inline int vgic_irq_is_edge(struct vgic_dist *dist, int irq)
 	return vgic_bitmap_get_irq_val(&dist->irq_cfg, 0, irq);
 }
 
+static inline void kvm_vgic_vcpu_set_pending_irq(struct kvm_vcpu *vcpu, int irq)
+{
+	if (irq < 32)
+		set_bit(irq, vcpu->arch.vgic_cpu.pending_percpu);
+	else
+		set_bit(irq - 32, vcpu->arch.vgic_cpu.pending_shared);
+}
+
+static inline void kvm_vgic_vcpu_clear_pending_irq(struct kvm_vcpu *vcpu, int irq)
+{
+	if (irq < 32)
+		clear_bit(irq, vcpu->arch.vgic_cpu.pending_percpu);
+	else
+		clear_bit(irq - 32, vcpu->arch.vgic_cpu.pending_shared);
+}
+
 /**
  * vgic_reg_access - access vgic register
  * @mmio:   pointer to the data describing the mmio access
@@ -365,7 +381,7 @@ static u32 vgic_cfg_expand(u16 val)
 	int i;
 
 	for (i = 0; i < 16; i++)
-		res |= (val >> i) << (2 * i + 1);
+		res |= ((val >> i) & 1) << (2 * i + 1);
 
 	return res;
 }
@@ -376,7 +392,7 @@ static u16 vgic_cfg_compress(u32 val)
 	int i;
 
 	for (i = 0; i < 16; i++)
-		res |= (val >> (i * 2 + 1)) << i;
+		res |= ((val >> (i * 2 + 1)) & 1) << i;
 
 	return res;
 }
@@ -610,24 +626,26 @@ static void vgic_dispatch_sgi(struct kvm_vcpu *vcpu, u32 reg)
 static int compute_pending_for_cpu(struct kvm_vcpu *vcpu)
 {
 	struct vgic_dist *dist = &vcpu->kvm->arch.vgic;
-	unsigned long *pending, *enabled, *pend;
+	unsigned long *pending, *enabled, *pend_percpu, *pend_shared;
 	int vcpu_id;
 
 	vcpu_id = vcpu->vcpu_id;
-	pend = vcpu->arch.vgic_cpu.pending;
+	pend_percpu = vcpu->arch.vgic_cpu.pending_percpu;
+	pend_shared = vcpu->arch.vgic_cpu.pending_shared;
 
 	pending = vgic_bitmap_get_cpu_map(&dist->irq_state, vcpu_id);
 	enabled = vgic_bitmap_get_cpu_map(&dist->irq_enabled, vcpu_id);
-	bitmap_and(pend, pending, enabled, 32);
+	bitmap_and(pend_percpu, pending, enabled, 32);
 
 	pending = vgic_bitmap_get_shared_map(&dist->irq_state);
 	enabled = vgic_bitmap_get_shared_map(&dist->irq_enabled);
-	bitmap_and(pend + 1, pending, enabled, VGIC_NR_SHARED_IRQS);
-	bitmap_and(pend + 1, pend + 1,
+	bitmap_and(pend_shared, pending, enabled, VGIC_NR_SHARED_IRQS);
+	bitmap_and(pend_shared, pend_shared,
 		   vgic_bitmap_get_shared_map(&dist->irq_spi_target[vcpu_id]),
 		   VGIC_NR_SHARED_IRQS);
 
-	return (find_first_bit(pend, VGIC_NR_IRQS) < VGIC_NR_IRQS);
+	return (find_first_bit(pend_percpu, 32) < 32 ||
+		find_first_bit(pend_shared, VGIC_NR_SHARED_IRQS) < VGIC_NR_SHARED_IRQS);
 }
 
 /*
@@ -717,7 +735,7 @@ static bool vgic_queue_irq(struct kvm_vcpu *vcpu, u8 sgi_source_id, int irq)
 	}
 
 	/* Try to use another LR for this interrupt */
-	lr = find_first_bit((unsigned long *)vgic_cpu->vgic_elrsr,
+	lr = find_first_zero_bit((unsigned long *)vgic_cpu->lr_used,
 			       vgic_cpu->nr_lr);
 	if (lr >= vgic_cpu->nr_lr)
 		return false;
@@ -730,7 +748,6 @@ static bool vgic_queue_irq(struct kvm_vcpu *vcpu, u8 sgi_source_id, int irq)
 	}
 
 	vgic_cpu->vgic_irq_lr_map[irq] = lr;
-	clear_bit(lr, (unsigned long *)vgic_cpu->vgic_elrsr);
 	set_bit(lr, vgic_cpu->lr_used);
 
 	return true;
@@ -744,7 +761,6 @@ static void __kvm_vgic_sync_to_cpu(struct kvm_vcpu *vcpu)
 {
 	struct vgic_cpu *vgic_cpu = &vcpu->arch.vgic_cpu;
 	struct vgic_dist *dist = &vcpu->kvm->arch.vgic;
-	unsigned long *pending;
 	int i, c, vcpu_id;
 	int overflow = 0;
 
@@ -763,8 +779,7 @@ static void __kvm_vgic_sync_to_cpu(struct kvm_vcpu *vcpu)
 	}
 
 	/* SGIs */
-	pending = vgic_bitmap_get_cpu_map(&dist->irq_state, vcpu_id);
-	for_each_set_bit(i, vgic_cpu->pending, 16) {
+	for_each_set_bit(i, vgic_cpu->pending_percpu, 16) {
 		unsigned long sources;
 
 		sources = dist->irq_sgi_sources[vcpu_id][i];
@@ -777,40 +792,43 @@ static void __kvm_vgic_sync_to_cpu(struct kvm_vcpu *vcpu)
 			clear_bit(c, &sources);
 		}
 
-		if (!sources)
-			clear_bit(i, pending);
+		if (!sources) {
+			vgic_bitmap_set_irq_val(&dist->irq_state, vcpu_id, i, 0);
+			kvm_vgic_vcpu_clear_pending_irq(vcpu, i);
+		}
 
 		dist->irq_sgi_sources[vcpu_id][i] = sources;
 	}
 
 	/* PPIs */
-	for_each_set_bit_from(i, vgic_cpu->pending, 32) {
+	for_each_set_bit_from(i, vgic_cpu->pending_percpu, 32) {
 		if (!vgic_queue_irq(vcpu, 0, i)) {
 			overflow = 1;
 			continue;
 		}
 
-		clear_bit(i, pending);
+		vgic_bitmap_set_irq_val(&dist->irq_state, vcpu_id, i, 0);
+		kvm_vgic_vcpu_clear_pending_irq(vcpu, i);
 	}
 
 
 	/* SPIs */
-	pending = vgic_bitmap_get_shared_map(&dist->irq_state);
-	for_each_set_bit_from(i, vgic_cpu->pending, VGIC_NR_IRQS) {
-		if (vgic_bitmap_get_irq_val(&dist->irq_active, 0, i))
+	for_each_set_bit(i, vgic_cpu->pending_shared, VGIC_NR_SHARED_IRQS) {
+		int irq = i + 32;
+		if (vgic_bitmap_get_irq_val(&dist->irq_active, 0, irq))
 			continue; /* level interrupt, already queued */
 
-		if (!vgic_queue_irq(vcpu, 0, i)) {
+		if (!vgic_queue_irq(vcpu, 0, irq)) {
 			overflow = 1;
 			continue;
 		}
 
 		/* Immediate clear on edge, set active on level */
-		if (vgic_irq_is_edge(dist, i)) {
-			clear_bit(i - 32, pending);
-			clear_bit(i, vgic_cpu->pending);
+		if (vgic_irq_is_edge(dist, irq)) {
+			vgic_bitmap_set_irq_val(&dist->irq_state, 0, irq, 0);
+			kvm_vgic_vcpu_clear_pending_irq(vcpu, irq);
 		} else {
-			vgic_bitmap_set_irq_val(&dist->irq_active, 0, i, 1);
+			vgic_bitmap_set_irq_val(&dist->irq_active, 0, irq, 1);
 		}
 	}
 
@@ -960,7 +978,7 @@ static bool vgic_update_irq_state(struct kvm *kvm, int cpuid,
 	vcpu = kvm_get_vcpu(kvm, cpuid);
 
 	if (level) {
-		set_bit(irq_num, vcpu->arch.vgic_cpu.pending);
+		kvm_vgic_vcpu_set_pending_irq(vcpu, irq_num);
 		set_bit(cpuid, &dist->irq_pending_on_cpu);
 	}
 
@@ -1028,11 +1046,11 @@ static irqreturn_t vgic_maintenance_handler(int irq, void *data)
 			/* Any additionnal pending interrupt? */
 			if (vgic_bitmap_get_irq_val(&dist->irq_state,
 						    vcpu->vcpu_id, irq)) {
-				set_bit(irq, vcpu->arch.vgic_cpu.pending);
+				kvm_vgic_vcpu_set_pending_irq(vcpu, irq);
 				set_bit(vcpu->vcpu_id,
 					&dist->irq_pending_on_cpu);
 			} else {
-				clear_bit(irq, vgic_cpu->pending);
+				kvm_vgic_vcpu_clear_pending_irq(vcpu, irq);
 			}
 		}
 	}
@@ -1076,7 +1094,9 @@ int kvm_vgic_vcpu_init(struct kvm_vcpu *vcpu)
 	reg = readl_relaxed(vcpu->kvm->arch.vgic.vctrl_base + GICH_VMCR);
 	vgic_cpu->vgic_vmcr = reg | (0x1f << 27); /* Priority */
 
-	vgic_cpu->vgic_hcr |= VGIC_HCR_EN; /* Get the show on the road... */
+	vgic_cpu->vgic_hcr = VGIC_HCR_EN; /* Get the show on the road... */
+
+	return 0;
 }
 
 static void vgic_init_maintenance_interrupt(void *info)

@@ -51,11 +51,11 @@
 struct vgic_bitmap {
 	union {
 		u32 reg[1];
-		unsigned long reg_ul[0];
+		DECLARE_BITMAP(reg_ul, 32);
 	} percpu[VGIC_MAX_CPUS];
 	union {
 		u32 reg[VGIC_NR_SHARED_IRQS / 32];
-		unsigned long reg_ul[0];
+		DECLARE_BITMAP(reg_ul, VGIC_NR_SHARED_IRQS);
 	} shared;
 };
 
@@ -199,7 +199,8 @@ struct vgic_cpu {
 	u8		vgic_irq_lr_map[VGIC_NR_IRQS];
 
 	/* Pending interrupts on this VCPU */
-	DECLARE_BITMAP(	pending, VGIC_NR_IRQS);
+	DECLARE_BITMAP(	pending_percpu, 32);
+	DECLARE_BITMAP(	pending_shared, VGIC_NR_SHARED_IRQS);
 
 	/* Bitmap of used/free list registers */
 	DECLARE_BITMAP(	lr_used, 64);
@@ -280,7 +281,11 @@ static inline int kvm_vgic_create(struct kvm *kvm)
 	return 0;
 }
 
-static inline void kvm_vgic_vcpu_init(struct kvm_vcpu *vcpu) {}
+static inline int kvm_vgic_vcpu_init(struct kvm_vcpu *vcpu)
+{
+	return 0;
+}
+
 static inline void kvm_vgic_sync_to_cpu(struct kvm_vcpu *vcpu) {}
 static inline void kvm_vgic_sync_from_cpu(struct kvm_vcpu *vcpu) {}
 
