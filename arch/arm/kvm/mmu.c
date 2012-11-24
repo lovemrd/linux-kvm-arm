@@ -41,6 +41,16 @@ static void kvm_tlb_flush_vmid(struct kvm *kvm)
 	kvm_call_hyp(__kvm_tlb_flush_vmid, kvm);
 }
 
+static void kvm_set_pte(pte_t *pte, pte_t new_pte)
+{
+	pte_val(*pte) = new_pte;
+	/*
+	 * flush_pmd_entry just takes a void pointer and cleans the necessary
+	 * cache entries, so we can reuse the function for ptes.
+	 */
+	flush_pmd_entry(pte);
+}
+
 static int mmu_topup_memory_cache(struct kvm_mmu_memory_cache *cache,
 				  int min, int max)
 {
@@ -140,13 +150,13 @@ static void create_hyp_pte_mappings(pmd_t *pmd, unsigned long start,
 		pte = pte_offset_kernel(pmd, addr);
 		if (pfn_base) {
 			BUG_ON(pfn_valid(*pfn_base));
-			set_pte_ext(pte, pfn_pte(*pfn_base, prot), 0);
+			kvm_set_pte(pte, pfn_pte(*pfn_base, prot));
 			(*pfn_base)++;
 		} else {
 			struct page *page;
 			BUG_ON(!virt_addr_valid(addr));
 			page = virt_to_page(addr);
-			set_pte_ext(pte, mk_pte(page, prot), 0);
+			kvm_set_pte(pte, mk_pte(page, prot));
 		}
 
 	}
@@ -270,6 +280,9 @@ int kvm_alloc_stage2_pgd(struct kvm *kvm)
 	if (!pgd)
 		return -ENOMEM;
 
+	/* stage-2 pgd must be aligned to its size */
+	VM_BUG_ON((unsigned long)pgd & (PGD2_SIZE - 1));
+
 	memset(pgd, 0, PTRS_PER_PGD2 * sizeof(pgd_t));
 	clean_dcache_area(pgd, PTRS_PER_PGD2 * sizeof(pgd_t));
 	kvm->arch.pgd = pgd;
@@ -277,43 +290,92 @@ int kvm_alloc_stage2_pgd(struct kvm *kvm)
 	return 0;
 }
 
-static void free_guest_pages(pte_t *pte, unsigned long addr)
+static void clear_pud_entry(pud_t *pud)
 {
-	unsigned int i;
-	struct page *pte_page;
-
-	pte_page = virt_to_page(pte);
-
-	for (i = 0; i < PTRS_PER_PTE; i++) {
-		if (pte_present(*pte))
-			put_page(pte_page);
-		pte++;
-	}
-
-	WARN_ON(page_count(pte_page) != 1);
+	pmd_t *pmd_table = pmd_offset(pud, 0);
+	pud_clear(pud);
+	pmd_free(NULL, pmd_table);
+	put_page(virt_to_page(pud));
 }
 
-static void free_stage2_ptes(pmd_t *pmd, unsigned long addr)
+static void clear_pmd_entry(pmd_t *pmd)
 {
-	unsigned int i;
-	pte_t *pte;
-	struct page *pmd_page;
+	pte_t *pte_table = pte_offset_kernel(pmd, 0);
+	pmd_clear(pmd);
+	pte_free_kernel(NULL, pte_table);
+	put_page(virt_to_page(pmd));
+}
 
-	pmd_page = virt_to_page(pmd);
+static bool pmd_empty(pmd_t *pmd)
+{
+	struct page *pmd_page = virt_to_page(pmd);
+	return page_count(pmd_page) == 1;
+}
 
-	for (i = 0; i < PTRS_PER_PMD; i++, addr += PMD_SIZE) {
-		BUG_ON(pmd_sect(*pmd));
-		if (!pmd_none(*pmd) && pmd_table(*pmd)) {
-			pte = pte_offset_kernel(pmd, addr);
-			free_guest_pages(pte, addr);
-			pte_free_kernel(NULL, pte);
-
-			put_page(pmd_page);
-		}
-		pmd++;
+static void clear_pte_entry(pte_t *pte)
+{
+	if (pte_present(*pte)) {
+		kvm_set_pte(pte, __pte(0));
+		put_page(virt_to_page(pte));
 	}
+}
 
-	WARN_ON(page_count(pmd_page) != 1);
+static bool pte_empty(pte_t *pte)
+{
+	struct page *pte_page = virt_to_page(pte);
+	return page_count(pte_page) == 1;
+}
+
+/**
+ * unmap_stage2_range -- Clear stage2 page table entries to unmap a range
+ * @kvm:   The VM pointer
+ * @start: The intermediate physical base address of the range to unmap
+ * @size:  The size of the area to unmap
+ *
+ * Clear a range of stage-2 mappings, lowering the various ref-counts.  Must
+ * be called while holding mmu_lock (unless for freeing the stage2 pgd before
+ * destroying the VM), otherwise another faulting VCPU may come in and mess
+ * with things behind our backs.
+ */
+static void unmap_stage2_range(struct kvm *kvm, phys_addr_t start, u64 size)
+{
+	pgd_t *pgd;
+	pud_t *pud;
+	pmd_t *pmd;
+	pte_t *pte;
+	phys_addr_t addr = start, end = start + size;
+	u64 range;
+
+	while (addr < end) {
+		pgd = kvm->arch.pgd + pgd_index(addr);
+		pud = pud_offset(pgd, addr);
+		if (pud_none(*pud)) {
+			addr += PUD_SIZE;
+			continue;
+		}
+
+		pmd = pmd_offset(pud, addr);
+		if (pmd_none(*pmd)) {
+			addr += PMD_SIZE;
+			continue;
+		}
+
+		pte = pte_offset_kernel(pmd, addr);
+		clear_pte_entry(pte);
+		range = PAGE_SIZE;
+
+		/* If we emptied the pte, walk back up the ladder */
+		if (pte_empty(pte)) {
+			clear_pmd_entry(pmd);
+			range = PMD_SIZE;
+			if (pmd_empty(pmd)) {
+				clear_pud_entry(pud);
+				range = PUD_SIZE;
+			}
+		}
+
+		addr += range;
+	}
 }
 
 /**
@@ -329,97 +391,14 @@ static void free_stage2_ptes(pmd_t *pmd, unsigned long addr)
  */
 void kvm_free_stage2_pgd(struct kvm *kvm)
 {
-	pgd_t *pgd;
-	pud_t *pud;
-	pmd_t *pmd;
-	unsigned long long i, addr;
-	struct page *pud_page;
-
 	if (kvm->arch.pgd == NULL)
 		return;
 
-	/*
-	 * We do this slightly different than other places, since we need more
-	 * than 32 bits and for instance pgd_addr_end converts to unsigned long.
-	 */
-	addr = 0;
-	for (i = 0; i < PTRS_PER_PGD2; i++) {
-		addr = i * (unsigned long long)PGDIR_SIZE;
-		pgd = kvm->arch.pgd + i;
-		pud = pud_offset(pgd, addr);
-		pud_page = virt_to_page(pud);
-
-		if (pud_none(*pud))
-			continue;
-
-		BUG_ON(pud_bad(*pud));
-
-		pmd = pmd_offset(pud, addr);
-		free_stage2_ptes(pmd, addr);
-		pmd_free(NULL, pmd);
-		put_page(pud_page);
-	}
-
-	WARN_ON(page_count(pud_page) != 1);
+	unmap_stage2_range(kvm, 0, KVM_PHYS_SIZE);
 	free_pages((unsigned long)kvm->arch.pgd, PGD2_ORDER);
 	kvm->arch.pgd = NULL;
 }
 
-/**
- * stage2_clear_pte -- Clear a stage-2 PTE.
- * @kvm:  The VM pointer
- * @addr: The physical address of the PTE
- *
- * Clear a stage-2 PTE, lowering the various ref-counts. Also takes
- * care of invalidating the TLBs.  Must be called while holding
- * mmu_lock, otherwise another faulting VCPU may come in and mess
- * things behind our back.
- */
-static void stage2_clear_pte(struct kvm *kvm, phys_addr_t addr)
-{
-	pgd_t *pgd;
-	pud_t *pud;
-	pmd_t *pmd;
-	pte_t *pte;
-	struct page *page;
-
-	pgd = kvm->arch.pgd + pgd_index(addr);
-	pud = pud_offset(pgd, addr);
-	if (pud_none(*pud))
-		return;
-
-	pmd = pmd_offset(pud, addr);
-	if (pmd_none(*pmd))
-		return;
-
-	pte = pte_offset_kernel(pmd, addr);
-	set_pte_ext(pte, __pte(0), 0);
-
-	page = virt_to_page(pte);
-	put_page(page);
-	if (page_count(page) != 1) {
-		kvm_tlb_flush_vmid(kvm);
-		return;
-	}
-
-	/* Need to remove pte page */
-	pmd_clear(pmd);
-	pte_free_kernel(NULL, (pte_t *)((unsigned long)pte & PAGE_MASK));
-
-	page = virt_to_page(pmd);
-	put_page(page);
-	if (page_count(page) != 1) {
-		kvm_tlb_flush_vmid(kvm);
-		return;
-	}
-
-	pud_clear(pud);
-	pmd_free(NULL, (pmd_t *)((unsigned long)pmd & PAGE_MASK));
-
-	page = virt_to_page(pud);
-	put_page(page);
-	kvm_tlb_flush_vmid(kvm);
-}
 
 static int stage2_set_pte(struct kvm *kvm, struct kvm_mmu_memory_cache *cache,
 			  phys_addr_t addr, const pte_t *new_pte, bool iomap)
@@ -459,7 +438,7 @@ static int stage2_set_pte(struct kvm *kvm, struct kvm_mmu_memory_cache *cache,
 
 	/* Create 2nd stage page table mapping - Level 3 */
 	old_pte = *pte;
-	set_pte_ext(pte, *new_pte, 0);
+	kvm_set_pte(pte, *new_pte);
 	if (pte_present(old_pte))
 		kvm_tlb_flush_vmid(kvm);
 	else
@@ -576,14 +555,7 @@ static int user_mem_abort(struct kvm_vcpu *vcpu, phys_addr_t fault_ipa,
 
 out_unlock:
 	spin_unlock(&vcpu->kvm->mmu_lock);
-	/*
-	 * XXX TODO FIXME:
--        * This is _really_ *weird* !!!
--        * We should be calling the _clean version, because we set the pfn dirty
-	 * if we map the page writable, but this causes memory failures in
-	 * guests under heavy memory pressure on the host and heavy swapping.
-	 */
-	kvm_release_pfn_dirty(pfn);
+	kvm_release_pfn_clean(pfn);
 	return 0;
 }
 
@@ -693,7 +665,8 @@ static void handle_hva_to_gpa(struct kvm *kvm,
 
 static void kvm_unmap_hva_handler(struct kvm *kvm, gpa_t gpa, void *data)
 {
-	stage2_clear_pte(kvm, gpa);
+	unmap_stage2_range(kvm, gpa, PAGE_SIZE);
+	kvm_tlb_flush_vmid(kvm);
 }
 
 int kvm_unmap_hva(struct kvm *kvm, unsigned long hva)
