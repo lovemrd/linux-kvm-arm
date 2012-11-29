@@ -136,14 +136,12 @@ void hyp_idmap_teardown(pgd_t *hyp_pgd)
 			hyp_idmap_del_pmd(pgd, addr);
 	} while (pgd++, addr = next, addr < end);
 }
-EXPORT_SYMBOL_GPL(hyp_idmap_teardown);
 
 void hyp_idmap_setup(pgd_t *hyp_pgd)
 {
 	identity_mapping_add(hyp_pgd, __hyp_idmap_text_start,
 			     __hyp_idmap_text_end, PMD_SECT_AP1);
 }
-EXPORT_SYMBOL_GPL(hyp_idmap_setup);
 #endif
 
 /*
