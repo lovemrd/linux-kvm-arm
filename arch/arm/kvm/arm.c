@@ -44,10 +44,7 @@
 #include <asm/kvm_emulate.h>
 #include <asm/kvm_coproc.h>
 #include <asm/opcodes.h>
-
-#ifdef REQUIRES_VIRT
-__asm__(".arch_extension	virt");
-#endif
+#include <asm/hvc.h>
 
 static DEFINE_PER_CPU(unsigned long, kvm_arm_hyp_stack_page);
 static struct vfp_hard_struct __percpu *kvm_host_vfp_state;
@@ -943,18 +940,9 @@ static void cpu_init_hyp_mode(void *vector)
 
 	/*
 	 * Call initialization code, and switch to the full blown
-	 * HYP code. The init code corrupts r12, so set the clobber
-	 * list accordingly.
+	 * HYP code.
 	 */
-	asm volatile (
-		"mov	r0, %[pgd_ptr]\n\t"
-		"mov	r1, %[hyp_stack_ptr]\n\t"
-		"mov	r2, %[vector_ptr]\n\t"
-		"hvc	#0\n\t" : :
-		[pgd_ptr] "r" (pgd_ptr),
-		[hyp_stack_ptr] "r" (hyp_stack_ptr),
-		[vector_ptr] "r" (vector_ptr) :
-		"r0", "r1", "r2", "r12");
+	hvc_call(0, pgd_ptr, hyp_stack_ptr, vector_ptr, 0, 0);
 }
 
 /**
